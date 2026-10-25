@@ -2,7 +2,7 @@
 // Google Cloud Console (APIs & Services → Credentials → OAuth client ID → Web application).
 import { randomBytes } from "node:crypto";
 
-import { collections, newId } from "../db/db.js";
+import { getDb } from "../db/db.js";
 
 const AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -97,43 +97,26 @@ export async function exchangeCode(request: Request, code: string): Promise<Goog
  * NGO / Volunteer, chosen on the sign-in page) only applies when the profile is first created.
  */
 export async function upsertProfile(identity: GoogleIdentity, role: string | null) {
-  const { profiles, admins } = await collections();
-  const now = new Date();
-  const profile = await profiles.findOneAndUpdate(
-    { google_sub: identity.sub },
-    {
-      $setOnInsert: {
-        _id: newId(),
-        google_sub: identity.sub,
-        full_name: identity.name ?? identity.email?.split("@")[0] ?? null,
-        email: identity.email,
-        role,
-        organization: null,
-        phone: null,
-        location_label: null,
-        latitude: null,
-        longitude: null,
-        created_at: now,
-        updated_at: now,
-      },
-    },
-    { upsert: true, returnDocument: "after" },
-  );
+  const sql = await getDb();
+  // The no-op DO UPDATE makes RETURNING yield the id for existing profiles too.
+  const [profile] = (await sql`
+    INSERT INTO profiles (google_sub, full_name, email, role)
+    VALUES (${identity.sub}, ${identity.name ?? identity.email?.split("@")[0] ?? null},
+            ${identity.email}, ${role})
+    ON CONFLICT (google_sub) DO UPDATE SET google_sub = EXCLUDED.google_sub
+    RETURNING id
+  `) as { id: string }[];
   if (!profile) throw new Error("Could not create the user profile.");
 
-  // Admin access isn't self-service: it comes from the admins collection, which can be
+  // Admin access isn't self-service: it comes from the admins table, which can be
   // bootstrapped by listing Google account emails in ADMIN_EMAILS.
   const adminEmails = (process.env["ADMIN_EMAILS"] ?? "")
     .split(",")
     .map((email) => email.trim().toLowerCase())
     .filter(Boolean);
   if (identity.email && adminEmails.includes(identity.email.toLowerCase())) {
-    await admins.updateOne(
-      { _id: profile._id },
-      { $setOnInsert: { created_at: now } },
-      { upsert: true },
-    );
+    await sql`INSERT INTO admins (id) VALUES (${profile.id}) ON CONFLICT DO NOTHING`;
   }
 
-  return profile._id;
+  return profile.id;
 }

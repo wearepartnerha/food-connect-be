@@ -1,7 +1,6 @@
 import { Hono } from "hono";
 
 import { requireAdmin } from "../auth/access.js";
-import { newId, toRow } from "../db/db.js";
 import type {
   ContactMessage,
   NgoRegistration,
@@ -30,44 +29,32 @@ export const admin = new Hono();
 
 // GET /api/admin/dashboard → AdminDashboard
 admin.get("/dashboard", async (c) => {
-  const { db } = await requireAdmin(c);
-  const newestFirst = { created_at: -1 } as const;
+  const { sql } = await requireAdmin(c);
 
-  const [
-    totalUsers,
-    totalMessages,
-    totalSignups,
-    profiles,
-    sponsorships,
-    messages,
-    signups,
-    registrations,
-  ] = await Promise.all([
-    db.profiles.countDocuments(),
-    db.contactMessages.countDocuments(),
-    db.volunteerSignups.countDocuments(),
-    db.profiles
-      .find({}, { projection: { google_sub: 0 } })
-      .sort(newestFirst)
-      .limit(LIST_LIMIT)
-      .toArray(),
-    db.sponsorships.find().sort(newestFirst).limit(LIST_LIMIT).toArray(),
-    db.contactMessages.find().sort(newestFirst).limit(LIST_LIMIT).toArray(),
-    db.volunteerSignups.find().sort(newestFirst).limit(LIST_LIMIT).toArray(),
-    db.ngoRegistrations.find().sort(newestFirst).limit(LIST_LIMIT).toArray(),
+  const [[stats], profiles, sponsorships, messages, signups, registrations] = await Promise.all([
+    sql`
+      SELECT (SELECT count(*) FROM profiles)::int AS total_users,
+             (SELECT count(*) FROM contact_messages)::int AS pending_contact_messages,
+             (SELECT count(*) FROM volunteer_signups)::int AS pending_volunteer_signups
+    `,
+    sql`
+      SELECT id, full_name, role, organization, phone, email, location_label, latitude,
+             longitude, created_at, updated_at
+      FROM profiles ORDER BY created_at DESC LIMIT ${LIST_LIMIT}
+    `,
+    sql`SELECT * FROM sponsorships ORDER BY created_at DESC LIMIT ${LIST_LIMIT}`,
+    sql`SELECT * FROM contact_messages ORDER BY created_at DESC LIMIT ${LIST_LIMIT}`,
+    sql`SELECT * FROM volunteer_signups ORDER BY created_at DESC LIMIT ${LIST_LIMIT}`,
+    sql`SELECT * FROM ngo_registrations ORDER BY created_at DESC LIMIT ${LIST_LIMIT}`,
   ]);
 
   const result: AdminDashboard = {
-    stats: {
-      total_users: totalUsers,
-      pending_contact_messages: totalMessages,
-      pending_volunteer_signups: totalSignups,
-    },
-    profiles: profiles.map((doc) => toRow<Profile>(doc)),
-    sponsorships: sponsorships.map((doc) => toRow<Sponsorship>(doc)),
-    messages: messages.map((doc) => toRow<ContactMessage>(doc)),
-    signups: signups.map((doc) => toRow<VolunteerSignup>(doc)),
-    registrations: registrations.map((doc) => toRow<NgoRegistration>(doc)),
+    stats: stats as AdminDashboard["stats"],
+    profiles: profiles as Profile[],
+    sponsorships: sponsorships as Sponsorship[],
+    messages: messages as ContactMessage[],
+    signups: signups as VolunteerSignup[],
+    registrations: registrations as NgoRegistration[],
   };
   return c.json(result);
 });
@@ -75,10 +62,12 @@ admin.get("/dashboard", async (c) => {
 // POST /api/admin/registrations/:id/approve — approves a partner registration by creating its
 // distribution center and linking the two.
 admin.post("/registrations/:id/approve", async (c) => {
-  const { db } = await requireAdmin(c);
+  const { sql } = await requireAdmin(c);
   const id = c.req.param("id");
 
-  const registration = await db.ngoRegistrations.findOne({ _id: id });
+  const [registration] = (await sql`
+    SELECT * FROM ngo_registrations WHERE id = ${id}
+  `) as NgoRegistration[];
   if (!registration) throw notFound("Registration not found.");
   if (registration.distribution_center_id)
     throw new HttpError(409, "This registration is already approved.");
@@ -86,21 +75,20 @@ admin.post("/registrations/:id/approve", async (c) => {
     throw new HttpError(409, "This registration has no verified location yet.");
   }
 
-  const centerId = newId();
-  await db.distributionCenters.insertOne({
-    _id: centerId,
-    name: registration.organization_name,
-    center_type: "Partner organization",
-    address: registration.area_label,
-    latitude: registration.latitude,
-    longitude: registration.longitude,
-    daily_meal_target: 0,
-    active: true,
-    created_at: new Date(),
-  });
-  await db.ngoRegistrations.updateOne(
-    { _id: registration._id },
-    { $set: { distribution_center_id: centerId, updated_at: new Date() } },
-  );
+  // One statement, so the center is only created if the registration is still unapproved.
+  const approved = await sql`
+    WITH center AS (
+      INSERT INTO distribution_centers (name, center_type, address, latitude, longitude)
+      SELECT organization_name, 'Partner organization', area_label, latitude, longitude
+      FROM ngo_registrations
+      WHERE id = ${id} AND distribution_center_id IS NULL
+      RETURNING id
+    )
+    UPDATE ngo_registrations
+    SET distribution_center_id = (SELECT id FROM center), updated_at = now()
+    WHERE id = ${id} AND EXISTS (SELECT 1 FROM center)
+    RETURNING id
+  `;
+  if (approved.length === 0) throw new HttpError(409, "This registration is already approved.");
   return c.body(null, 204);
 });

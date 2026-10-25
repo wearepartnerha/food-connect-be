@@ -1,6 +1,5 @@
-// Row shapes returned to API clients. Each MongoDB document stores its string UUID as `_id`;
-// `toRow()` in db.ts maps it to `id` and serializes Dates to ISO strings so these types match
-// the JSON clients receive.
+// Row shapes returned to API clients, one per Postgres table (see the schema in db.ts). The
+// driver returns timestamptz columns as Dates, which serialize to the ISO strings typed here.
 
 export type Profile = {
   id: string;
@@ -112,18 +111,3 @@ export type AuthUser = {
   id: string;
   email: string | null;
 };
-
-/** Stored shape of a row: `id` becomes `_id`, ISO timestamps become Dates. */
-export type Doc<Row extends { id: string }> = {
-  _id: string;
-} & {
-  [K in Exclude<keyof Row, "id">]: K extends `${string}_at`
-    ? null extends Row[K]
-      ? Date | null
-      : Date
-    : Row[K];
-};
-
-/** Profiles double as the user record, keyed by our own UUID and linked to Google by `google_sub`. */
-export type ProfileDoc = Doc<Profile> & { google_sub: string };
-export type AdminDoc = { _id: string; created_at: Date };

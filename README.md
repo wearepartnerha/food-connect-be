@@ -1,6 +1,6 @@
 # food-connect-be
 
-REST API for **Food Connect**: MongoDB data, Google sign-in, and every read/write the frontend
+REST API for **Food Connect**: Neon Postgres data, Google sign-in, and every read/write the frontend
 makes. Built with [Hono](https://hono.dev) on Node.js 22+.
 
 The frontend lives in a separate repository and talks to this service only over HTTP.
@@ -8,7 +8,7 @@ The frontend lives in a separate repository and talks to this service only over 
 ## Run locally
 
 ```sh
-cp .env.example .env   # fill in MONGODB_URI, GOOGLE_*, SESSION_SECRET, ADMIN_EMAILS
+cp .env.example .env   # fill in DATABASE_URL, GOOGLE_*, SESSION_SECRET, ADMIN_EMAILS
 npm install
 npm run dev            # http://localhost:4000, restarts on change
 ```
@@ -30,7 +30,7 @@ In Google Cloud Console, add `<API_URL>/api/auth/callback/google` (e.g.
 | `PORT`                                     | Port to listen on (default `4000`).                                                            |
 | `API_URL`                                  | Public URL of this API; builds the OAuth redirect URI. Set it behind a proxy.                  |
 | `FRONTEND_URL`                             | Comma-separated frontend origins allowed by CORS. The first is where users land after sign-in. |
-| `MONGODB_URI`, `MONGODB_DB`                | MongoDB connection string and database name.                                                   |
+| `DATABASE_URL`                             | Neon Postgres connection string. Tables are created automatically on first request.            |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Google OAuth client ("Web application").                                                       |
 | `SESSION_SECRET`                           | 32+ random characters; signs session tokens.                                                   |
 | `ADMIN_EMAILS`                             | Comma-separated Google emails granted admin on sign-in.                                        |
@@ -85,7 +85,7 @@ src/
   index.ts          Node server entry
   app.ts            Hono app: CORS, routes, error handling
   auth/             session tokens, Google OAuth, access checks
-  db/               MongoDB connection, indexes, row types
+  db/               Neon Postgres client, schema, row types
   routes/           account, admin, kitchen, geocode, auth endpoints
   lib/              config, HTTP helpers, shared constants
 ```

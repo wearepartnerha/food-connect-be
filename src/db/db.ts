@@ -1,97 +1,148 @@
-// MongoDB access. `collections()` connects lazily on first use and creates indexes once.
-import { MongoClient, type Db } from "mongodb";
+// Neon Postgres access over HTTP. `getDb()` connects lazily on first use and creates the schema
+// once per process (every statement is idempotent, so restarts and multiple instances are safe).
+import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
 
-import type {
-  AdminDoc,
-  ContactMessage,
-  Doc,
-  DistributionCenter,
-  KitchenInventoryItem,
-  MealLog,
-  NgoRegistration,
-  NotificationRow,
-  ProfileDoc,
-  Sponsorship,
-  VolunteerSignup,
-} from "./types.js";
+export type Sql = NeonQueryFunction<false, false>;
 
-type Cache = { client: MongoClient; db: Promise<Db> };
+// Cached on globalThis so `tsx watch` reloads reuse one client and skip re-running the schema.
+const globalCache = globalThis as typeof globalThis & { __fwcDb?: Promise<Sql> };
 
-// Cached on globalThis so `tsx watch` reloads reuse one connection pool.
-const globalCache = globalThis as typeof globalThis & { __fwcMongo?: Cache };
+// Ids are text UUIDs (not the uuid type) so a malformed id in a URL is simply "not found".
+const SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS profiles (
+    id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    google_sub text NOT NULL UNIQUE,
+    full_name text,
+    role text,
+    organization text,
+    phone text,
+    email text,
+    location_label text,
+    latitude double precision,
+    longitude double precision,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS profiles_created_at_idx ON profiles (created_at DESC)`,
+  `CREATE TABLE IF NOT EXISTS admins (
+    id text PRIMARY KEY REFERENCES profiles (id) ON DELETE CASCADE,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE TABLE IF NOT EXISTS notifications (
+    id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    user_id text NOT NULL REFERENCES profiles (id) ON DELETE CASCADE,
+    title text NOT NULL,
+    body text,
+    read boolean NOT NULL DEFAULT false,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS notifications_user_idx ON notifications (user_id, created_at DESC)`,
+  `CREATE TABLE IF NOT EXISTS distribution_centers (
+    id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    name text NOT NULL,
+    center_type text NOT NULL,
+    address text,
+    latitude double precision,
+    longitude double precision,
+    daily_meal_target integer NOT NULL DEFAULT 0,
+    active boolean NOT NULL DEFAULT true,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS distribution_centers_name_idx ON distribution_centers (name)`,
+  `CREATE TABLE IF NOT EXISTS ngo_registrations (
+    id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    user_id text NOT NULL UNIQUE REFERENCES profiles (id) ON DELETE CASCADE,
+    organization_name text NOT NULL,
+    registration_80g text NOT NULL,
+    contact_person text NOT NULL,
+    contact_phone text NOT NULL,
+    contact_email text,
+    pincode text NOT NULL,
+    area_label text,
+    latitude double precision,
+    longitude double precision,
+    status text NOT NULL DEFAULT 'Pending',
+    verified_at timestamptz,
+    distribution_center_id text REFERENCES distribution_centers (id) ON DELETE SET NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS ngo_registrations_created_at_idx ON ngo_registrations (created_at DESC)`,
+  `CREATE TABLE IF NOT EXISTS kitchen_inventory (
+    id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    category text NOT NULL,
+    item_name text NOT NULL,
+    unit text NOT NULL,
+    current_stock double precision NOT NULL,
+    reorder_threshold double precision NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    updated_by text REFERENCES profiles (id) ON DELETE SET NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS kitchen_inventory_order_idx ON kitchen_inventory (category, item_name)`,
+  `CREATE TABLE IF NOT EXISTS meal_logs (
+    id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    center_id text NOT NULL REFERENCES distribution_centers (id) ON DELETE CASCADE,
+    log_date date NOT NULL,
+    meals_cooked integer NOT NULL,
+    children_served integer NOT NULL,
+    logged_by text REFERENCES profiles (id) ON DELETE SET NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS meal_logs_log_date_idx ON meal_logs (log_date)`,
+  `CREATE TABLE IF NOT EXISTS sponsorships (
+    id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    sponsor_id text REFERENCES profiles (id) ON DELETE SET NULL,
+    sponsor_name text NOT NULL,
+    sponsor_email text,
+    amount_inr double precision NOT NULL,
+    meals_sponsored integer NOT NULL,
+    message text,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS sponsorships_sponsor_idx ON sponsorships (sponsor_id, created_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS sponsorships_created_at_idx ON sponsorships (created_at DESC)`,
+  `CREATE TABLE IF NOT EXISTS contact_messages (
+    id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    name text NOT NULL,
+    email text NOT NULL,
+    message text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS contact_messages_created_at_idx ON contact_messages (created_at DESC)`,
+  `CREATE TABLE IF NOT EXISTS volunteer_signups (
+    id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    name text NOT NULL,
+    email text NOT NULL,
+    phone text,
+    location_label text,
+    message text,
+    created_at timestamptz NOT NULL DEFAULT now()
+  )`,
+  `CREATE INDEX IF NOT EXISTS volunteer_signups_created_at_idx ON volunteer_signups (created_at DESC)`,
+];
 
-function connect(): Cache {
-  const uri = process.env["MONGODB_URI"];
-  if (!uri) {
+async function connect(): Promise<Sql> {
+  const url = process.env["DATABASE_URL"];
+  if (!url) {
     const message =
-      "Missing environment variable MONGODB_URI. Add your MongoDB connection string to .env.";
-    console.error(`[MongoDB] ${message}`);
+      "Missing environment variable DATABASE_URL. Add your Neon connection string to .env.";
+    console.error(`[Neon] ${message}`);
     throw new Error(message);
   }
-  const client = new MongoClient(uri);
-  const db = client.connect().then(async (connected) => {
-    // With no DB name in the URI (the Atlas default), fall back to MONGODB_DB.
-    const database = connected.db(process.env["MONGODB_DB"] || undefined);
-    await ensureIndexes(database);
-    return database;
-  });
-  // Don't cache a failed connection — the next request retries.
-  db.catch(() => {
-    if (globalCache.__fwcMongo?.client === client) delete globalCache.__fwcMongo;
-  });
-  return { client, db };
+  const sql = neon(url);
+  // In order: tables must exist before the indexes and foreign keys that reference them.
+  for (const statement of SCHEMA) await sql.query(statement);
+  return sql;
 }
 
-export function getDb(): Promise<Db> {
-  globalCache.__fwcMongo ??= connect();
-  return globalCache.__fwcMongo.db;
-}
-
-async function ensureIndexes(db: Db) {
-  await Promise.all([
-    db.collection("profiles").createIndex({ google_sub: 1 }, { unique: true }),
-    db.collection("profiles").createIndex({ created_at: -1 }),
-    db.collection("notifications").createIndex({ user_id: 1, created_at: -1 }),
-    db.collection("ngo_registrations").createIndex({ user_id: 1 }, { unique: true }),
-    db.collection("ngo_registrations").createIndex({ created_at: -1 }),
-    db.collection("kitchen_inventory").createIndex({ category: 1, item_name: 1 }),
-    db.collection("distribution_centers").createIndex({ name: 1 }),
-    db.collection("meal_logs").createIndex({ log_date: 1 }),
-    db.collection("sponsorships").createIndex({ sponsor_id: 1, created_at: -1 }),
-    db.collection("sponsorships").createIndex({ created_at: -1 }),
-    db.collection("contact_messages").createIndex({ created_at: -1 }),
-    db.collection("volunteer_signups").createIndex({ created_at: -1 }),
-  ]);
-}
-
-export async function collections() {
-  const db = await getDb();
-  return {
-    profiles: db.collection<ProfileDoc>("profiles"),
-    admins: db.collection<AdminDoc>("admins"),
-    notifications: db.collection<Doc<NotificationRow>>("notifications"),
-    contactMessages: db.collection<Doc<ContactMessage>>("contact_messages"),
-    volunteerSignups: db.collection<Doc<VolunteerSignup>>("volunteer_signups"),
-    ngoRegistrations: db.collection<Doc<NgoRegistration>>("ngo_registrations"),
-    kitchenInventory: db.collection<Doc<KitchenInventoryItem>>("kitchen_inventory"),
-    distributionCenters: db.collection<Doc<DistributionCenter>>("distribution_centers"),
-    mealLogs: db.collection<Doc<MealLog>>("meal_logs"),
-    sponsorships: db.collection<Doc<Sponsorship>>("sponsorships"),
-  };
-}
-
-export type Collections = Awaited<ReturnType<typeof collections>>;
-
-/** Maps a stored document to the row shape the browser expects (`_id` → `id`, Date → ISO string). */
-export function toRow<Row extends { id: string }>(doc: Doc<Row>): Row {
-  const { _id, ...rest } = doc as { _id: string } & Record<string, unknown>;
-  const row: Record<string, unknown> = { id: _id };
-  for (const [key, value] of Object.entries(rest)) {
-    row[key] = value instanceof Date ? value.toISOString() : value;
+export function getDb(): Promise<Sql> {
+  if (!globalCache.__fwcDb) {
+    const db = connect();
+    // Don't cache a failed connection — the next request retries.
+    db.catch(() => {
+      if (globalCache.__fwcDb === db) delete globalCache.__fwcDb;
+    });
+    globalCache.__fwcDb = db;
   }
-  return row as Row;
-}
-
-export function newId() {
-  return crypto.randomUUID();
+  return globalCache.__fwcDb;
 }

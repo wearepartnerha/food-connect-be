@@ -9,8 +9,6 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "22"
-      - key: MONGODB_DB
-        value: food_waste_connect
       - key: SESSION_SECRET
         generateValue: true
       # Set these in the Render dashboard; secrets never live in this file.
@@ -18,7 +16,7 @@ services:
         sync: false
       - key: FRONTEND_URL
         sync: false
-      - key: MONGODB_URI
+      - key: DATABASE_URL
         sync: false
       - key: GOOGLE_CLIENT_ID
         sync: false
